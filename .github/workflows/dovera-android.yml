@@ -1,0 +1,117 @@
+name: Dovera Android debug
+
+on:
+  push:
+    branches:
+      - dovera-branding
+    paths:
+      - "apps/multiplatform/**"
+      - ".github/workflows/dovera-android.yml"
+      - ".gitmodules"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK components
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          set -euxo pipefail
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/cmdline-tools/bin:$ANDROID_HOME/platform-tools:$PATH"
+          command -v sdkmanager
+          # Avoid pipefail treating yes' SIGPIPE (after sdkmanager accepts licenses) as a failure.
+          set +o pipefail
+          yes | sdkmanager --licenses
+          set -o pipefail
+          sdkmanager --sdk_root="$ANDROID_HOME" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1"
+
+          # NDK downloads can be interrupted on hosted runners. Remove partial SDK
+          # downloads and retry the pinned version before failing the job.
+          for attempt in 1 2 3; do
+            rm -rf "$ANDROID_HOME/.downloadIntermediates" "$ANDROID_HOME/.temp" "$ANDROID_HOME/ndk/23.1.7779620"
+            if sdkmanager --sdk_root="$ANDROID_HOME" --install "ndk;23.1.7779620"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "NDK 23.1.7779620 failed after 3 clean download attempts" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          test -x "$ANDROID_HOME/ndk/23.1.7779620/ndk-build"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/23.1.7779620" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/ndk/23.1.7779620" >> "$GITHUB_PATH"
+
+      - name: Download verified upstream native libraries from official Android releases
+        run: |
+          set -euxo pipefail
+          LIBS="apps/multiplatform/common/src/commonMain/cpp/android/libs"
+          mkdir -p "$LIBS/arm64-v8a" "$LIBS/armeabi-v7a" .native-apks
+
+          # The fork's stable source is v7.0.4 plus six later commits; those commits
+          # are documentation/desktop-only, so the official v7.0.4 Android core
+          # libraries match the Android/core source used by Dovera.
+          BASE="https://git.simplex.chat/simplex-chat/simplex-chat/releases/download/v7.0.4"
+          curl -fL --retry 4 --retry-all-errors "$BASE/simplex-aarch64.apk" -o .native-apks/simplex-aarch64.apk
+          curl -fL --retry 4 --retry-all-errors "$BASE/simplex-armv7a.apk" -o .native-apks/simplex-armv7a.apk
+
+          echo "17966066a1e4369ebc8c569baec9607213b510a53b328279eb516facb3e7db29  .native-apks/simplex-aarch64.apk" | sha256sum -c -
+          echo "7503603e83164e05ef60b0dbdca517260fe9f8b35954d2fcf79ef23981889524  .native-apks/simplex-armv7a.apk" | sha256sum -c -
+
+          for lib in libsimplex.so libsupport.so; do
+            unzip -p .native-apks/simplex-aarch64.apk "lib/arm64-v8a/$lib" > "$LIBS/arm64-v8a/$lib"
+            unzip -p .native-apks/simplex-armv7a.apk "lib/armeabi-v7a/$lib" > "$LIBS/armeabi-v7a/$lib"
+            test -s "$LIBS/arm64-v8a/$lib"
+            test -s "$LIBS/armeabi-v7a/$lib"
+          done
+          file "$LIBS"/*/*.so
+
+      - name: Verify native library architectures
+        run: |
+          set -euxo pipefail
+          LIBS="apps/multiplatform/common/src/commonMain/cpp/android/libs"
+          readelf -h "$LIBS/arm64-v8a/libsimplex.so" | grep -E 'Machine:.*AArch64'
+          readelf -h "$LIBS/arm64-v8a/libsupport.so" | grep -E 'Machine:.*AArch64'
+          readelf -h "$LIBS/armeabi-v7a/libsimplex.so" | grep -E 'Machine:.*ARM'
+          readelf -h "$LIBS/armeabi-v7a/libsupport.so" | grep -E 'Machine:.*ARM'
+          for lib in "$LIBS"/*/*.so; do
+            test -s "$lib"
+            file "$lib"
+          done
+
+      - name: Archive verified native libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: dovera-android-native-libraries
+          path: apps/multiplatform/common/src/commonMain/cpp/android/libs/*/*.so
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build Dovera FOSS debug APK
+        working-directory: apps/multiplatform
+        run: ./gradlew --no-daemon --stacktrace :android:assembleFossDebug
+
+      - name: Upload debug APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dovera-android-foss-debug
+          path: apps/multiplatform/android/build/outputs/apk/foss/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
